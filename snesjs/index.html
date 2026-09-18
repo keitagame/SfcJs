@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>SnesJs</title>
+<style>
+  body {
+    background: #000000;
+    color: #eee;
+    font-family: sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 16px;
+  }
+  #screen {
+    background: #000;
+    image-rendering: pixelated;
+    width: 512px;
+    height: 480px;
+    border: 1px solid #fff;
+  }
+  #bar {
+    margin: 10px 0;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+  }
+  #log {
+    width: 768px;
+    height: 100px;
+    overflow-y: auto;
+    background: #111;
+    border: 1px solid #444;
+    font-size: 12px;
+    padding: 6px;
+    white-space: pre-wrap;
+    font-family: monospace;
+  }
+  button { cursor: pointer; }
+  #help {
+    width: 768px;
+    font-size: 12px;
+    color: #aaa;
+    margin-top: 8px;
+  }
+  img{
+    image-rendering: pixelated;
+    width:500px;
+  }
+</style>
+</head>
+<body>
+
+<img src="NANDSP.png">
+<div id="bar">
+  <input type="file" id="romInput" accept=".sfc,.smc,.bin">
+  <input type="file" id="spcInput" accept=".spc"> 
+  <label><input type="checkbox" id="hiromCheck"> Force HiROM</label>
+  <button id="pauseBtn" disabled>Pause</button>
+  <button id="muteBtn">Mute</button>
+</div>
+
+<canvas id="screen" width="512" height="480"></canvas>
+<div style="display:none">
+<div id="help">
+  操作方法: 十字キー = 矢印キー / A = X / B = Z / X = S / Y = A / L = Q / R = W / Start = Enter / Select = Shift
+</div>
+
+<div id="log"></div>
+</div>
+<!-- Core emulator files -->
+<script src="cart.js"></script>
+<script src="cpu.js"></script>
+<script src="pipu.js"></script>
+<script src="spc.js"></script>
+<script src="dsp.js"></script>
+<script src="apu.js"></script>
+<script src="snes.js"></script>
+<script src="kikisen.js"></script>
+<script src="kikisen_spc.js"></script>
+<script>
+// ---------------------------------------------------------------------------
+// Utility functions expected by the core files but not defined anywhere in
+// them (log/clearArray/getByteRep/getWordRep/getLongRep).
+// ---------------------------------------------------------------------------
+const logEl = document.getElementById('log');
+function log(msg) {
+  console.log(msg);
+  if (logEl) {
+    logEl.textContent += msg + "\n";
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+}
+function clearArray(arr) { arr.fill(0); }
+function getByteRep(v) { return (v & 0xff).toString(16).padStart(2, '0'); }
+function getWordRep(v) { return (v & 0xffff).toString(16).padStart(4, '0'); }
+function getLongRep(v) { return (v & 0xffffff).toString(16).padStart(6, '0'); }
+
+// ---------------------------------------------------------------------------
+// Snes instance + canvas setup
+// ---------------------------------------------------------------------------
+const snes = new Snes();
+
+const canvas = document.getElementById('screen');
+const ctx = canvas.getContext('2d');
+const frameImage = ctx.createImageData(512, 480);
+// pre-fill alpha so the whole buffer is opaque even before the first frame
+for (let i = 3; i < frameImage.data.length; i += 4) frameImage.data[i] = 255;
+
+let running = false;
+let paused = false;
+let romLoaded = false;
+
+// ---------------------------------------------------------------------------
+// Audio.
+//
+// Apu.setSamples(left, right, n) resamples exactly ONE FRAME's worth of DSP
+// output (534 samples, i.e. 32000Hz / 60fps) into an n-length buffer, then
+// resets the DSP's internal sample offset to 0. So it must be called once
+// per emulated frame, right after runFrame() -- not from an independent
+// audio callback pulling an arbitrary chunk size, or the 534 source samples
+// get stretched/re-read to fill however many samples the audio callback
+// asked for, which is what was making the pitch sound too low.
+//
+// Fix: pull exactly one frame's audio (resampled to audioCtx.sampleRate)
+// right after runFrame(), and push it into a small ring buffer that the
+// ScriptProcessor callback drains from at its own pace.
+// ---------------------------------------------------------------------------
+let audioCtx = null;
+let scriptNode = null;
+let muted = false;
+
+// ring buffer sized for a couple hundred ms of audio headroom
+const RING_SIZE = 1 << 15;
+const ringL = new Float32Array(RING_SIZE);
+const ringR = new Float32Array(RING_SIZE);
+let ringWrite = 0;
+let ringRead = 0;
+let ringCount = 0;
+
+function ringPush(left, right) {
+  for (let i = 0; i < left.length; i++) {
+    if (ringCount >= RING_SIZE) break; // drop if the ring is already full (audio thread stalled)
+    ringL[ringWrite] = left[i];
+    ringR[ringWrite] = right[i];
+    ringWrite = (ringWrite + 1) & (RING_SIZE - 1);
+    ringCount++;
+  }
+}
+
+// scratch buffer to receive one frame of audio at the AudioContext's
+// native sample rate (e.g. 44100/48000 Hz instead of the SNES's 32000 Hz)
+let frameAudioL = null;
+let frameAudioR = null;
+
+function pushFrameAudio() {
+  if (!audioCtx) return;
+  const samplesPerFrame = Math.ceil(audioCtx.sampleRate / 60);
+  if (!frameAudioL || frameAudioL.length !== samplesPerFrame) {
+    frameAudioL = new Float32Array(samplesPerFrame);
+    frameAudioR = new Float32Array(samplesPerFrame);
+  }
+  snes.setSamples(frameAudioL, frameAudioR, samplesPerFrame);
+  ringPush(frameAudioL, frameAudioR);
+}
+
+function setupAudio() {
+  if (audioCtx) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  scriptNode = audioCtx.createScriptProcessor(2048, 0, 2);
+  scriptNode.onaudioprocess = function(e) {
+    const outL = e.outputBuffer.getChannelData(0);
+    const outR = e.outputBuffer.getChannelData(1);
+    if (!running || paused || muted || !romLoaded) {
+      outL.fill(0);
+      outR.fill(0);
+      return;
+    }
+    for (let i = 0; i < outL.length; i++) {
+      if (ringCount > 0) {
+        outL[i] = ringL[ringRead];
+        outR[i] = ringR[ringRead];
+        ringRead = (ringRead + 1) & (RING_SIZE - 1);
+        ringCount--;
+      } else {
+        // underrun: emit silence rather than stale data
+        outL[i] = 0;
+        outR[i] = 0;
+      }
+    }
+  };
+  scriptNode.connect(audioCtx.destination);
+}
+
+// ---------------------------------------------------------------------------
+// Rom loading
+// ---------------------------------------------------------------------------
+const romInput = document.getElementById('romInput');
+const hiromCheck = document.getElementById('hiromCheck');
+const pauseBtn = document.getElementById('pauseBtn');
+const muteBtn = document.getElementById('muteBtn');
+
+romInput.addEventListener('change', function(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function() {
+    const rom = new Uint8Array(reader.result);
+    const isHirom = hiromCheck.checked;
+    const ok = snes.loadRom(rom, isHirom);
+    if (!ok) {
+      log("Failed to load rom.");
+      return;
+    }
+    snes.reset(true);
+    romLoaded = true;
+    paused = false;
+    pauseBtn.disabled = false;
+    pauseBtn.textContent = "Pause";
+    setupAudio();
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+    if (!running) {
+      running = true;
+      // 時間管理変数を初期化
+      lastTime = performance.now();
+      accumulator = 0;
+      requestAnimationFrame(frameLoop);
+    }
+  };
+  reader.readAsArrayBuffer(file);
+});
+
+pauseBtn.addEventListener('click', function() {
+  if (!romLoaded) return;
+  paused = !paused;
+  pauseBtn.textContent = paused ? "Resume" : "Pause";
+  if (!paused) {
+    lastTime = performance.now(); // 一時停止解除時の跳ね上がり防止
+  }
+});
+
+muteBtn.addEventListener('click', function() {
+  muted = !muted;
+  muteBtn.textContent = muted ? "Unmute" : "Mute";
+  if (!muted && audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+});
+
+// ---------------------------------------------------------------------------
+// Main loop: 実時間(performance.now)に同期させ、遅れがあれば描画スキップして強引に追いつかせる
+// ---------------------------------------------------------------------------
+let lastTime = performance.now();
+let accumulator = 0;
+const MS_PER_FRAME = 1000 / 60;     // 1フレームあたりの理想ミリ秒 (約16.67ms)
+const MAX_FRAMES_PER_STEP = 10;      // 1回の描画更新で追いつかせる最大フレーム数（処理落ちスパイラル防止）
+
+function frameLoop(now) {
+  if (!running) return;
+
+  if (romLoaded && !paused) {
+    // 前回からの経過時間を計算
+    const delta = now - lastTime;
+    lastTime = now;
+
+    // タブ切り替え等で大きく飛んだ場合の上限を設定 (最大200ms分)
+    accumulator += Math.min(delta, 200);
+
+    // 今回のターンで進めるべきフレーム数
+    let framesToRun = Math.floor(accumulator / MS_PER_FRAME);
+
+    // 処理が重すぎて無限に遅れが溜まるのを防ぐため、1回の上限を制限
+    if (framesToRun > MAX_FRAMES_PER_STEP) {
+      framesToRun = MAX_FRAMES_PER_STEP;
+      accumulator = 0; // 追いつききれない遅れは切り捨てる
+    } else {
+      accumulator -= framesToRun * MS_PER_FRAME;
+    }
+
+    if (framesToRun > 0) {
+      try {
+        for (let i = 0; i < framesToRun; i++) {
+          // 最後の1フレーム以外は PPU描画（snes.runFrame(true)）をスキップして高速化
+          const isLastFrame = (i === framesToRun - 1);
+          
+          // noPpu = !isLastFrame (途中フレームは画面描画計算を行わない)
+          snes.runFrame(!isLastFrame);
+
+          if (isLastFrame) {
+            snes.setPixels(frameImage.data);
+            ctx.putImageData(frameImage, 0, 0);
+          }
+
+          // 音声処理を実行
+          pushFrameAudio();
+        }
+      } catch (err) {
+        log("Emulation error: " + err.message);
+        console.error(err);
+        paused = true;
+        pauseBtn.textContent = "Resume";
+      }
+    }
+  } else {
+    lastTime = now;
+  }
+
+  requestAnimationFrame(frameLoop);
+}
+// ---------------------------------------------------------------------------
+// Keyboard input -> joypad 1
+// Bit numbers follow the standard SNES auto-joypad-read report order:
+// 0:B 1:Y 2:Select 3:Start 4:Up 5:Down 6:Left 7:Right 8:A 9:X 10:L 11:R
+// ---------------------------------------------------------------------------
+const keyMap = {
+  "ArrowUp": 4,
+  "ArrowDown": 5,
+  "ArrowLeft": 6,
+  "ArrowRight": 7,
+  "KeyX": 8,      // A button
+  "KeyZ": 0,      // B button
+  "KeyS": 9,      // X button
+  "KeyA": 1,      // Y button
+  "KeyQ": 10,     // L
+  "KeyW": 11,     // R
+  "Enter": 3,     // Start
+  "ShiftLeft": 2, // Select
+  "ShiftRight": 2
+};
+
+window.addEventListener('keydown', function(e) {
+  const bit = keyMap[e.code];
+  if (bit !== undefined) {
+    snes.setPad1ButtonPressed(bit);
+    e.preventDefault();
+  }
+});
+window.addEventListener('keyup', function(e) {
+  const bit = keyMap[e.code];
+  if (bit !== undefined) {
+    snes.setPad1ButtonReleased(bit);
+    e.preventDefault();
+  }
+});
+
+log("Ready. ROMファイル (.sfc/.smc) を選択してください。");
+</script>
+</body>
+</html>
