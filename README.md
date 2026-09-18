@@ -1,2 +1,3 @@
 # SfcJs
-javascript sfc emulator 
+spcプレイヤーを作ったので、sfcエミュレータも作ってみました。<br>
+ほぼsnesjsから流用しました...
