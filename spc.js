@@ -578,7 +578,17 @@ Spc.prototype._buildOpTable = function() {
   this.opTable = T;
 }
 
-
+// setSamples 実装例の概念コード
+function setSamples(outL, outR, length) {
+  const ratio = 32000 / audioCtx.sampleRate; // 例: 32000 / 44100 = 約 0.7256
+  for (let i = 0; i < length; i++) {
+    // 44.1kHzの1ステップに対して 32kHzバッファを ratio 分だけ進めて読み出す
+    const readIndex = Math.floor(this.readOffset);
+    outL[i] = dsp.samplesL[readIndex & 0xffff];
+    outR[i] = dsp.samplesR[readIndex & 0xffff];
+    this.readOffset += ratio;
+  }
+}
 // ============================================================================
 // S-DSP
 // ============================================================================

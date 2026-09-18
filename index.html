@@ -55,6 +55,7 @@
 <img src="NANDSP.png">
 <div id="bar">
   <input type="file" id="romInput" accept=".sfc,.smc,.bin">
+  <input type="file" id="spcInput" accept=".spc"> 
   <label><input type="checkbox" id="hiromCheck"> Force HiROM</label>
   <button id="pauseBtn" disabled>Pause</button>
   <button id="muteBtn">Mute</button>
@@ -75,7 +76,8 @@
 <script src="spc.js"></script>
 <script src="apu.js"></script>
 <script src="snes.js"></script>
-
+<script src="kikisen.js"></script>
+<script src="kikisen_spc.js"></script>
 <script>
 // ---------------------------------------------------------------------------
 // Utility functions expected by the core files but not defined anywhere in
@@ -110,16 +112,61 @@ let paused = false;
 let romLoaded = false;
 
 // ---------------------------------------------------------------------------
-// Audio: ScriptProcessorNode pulling samples straight from the Snes/Apu.
+// Audio.
+//
+// Apu.setSamples(left, right, n) resamples exactly ONE FRAME's worth of DSP
+// output (534 samples, i.e. 32000Hz / 60fps) into an n-length buffer, then
+// resets the DSP's internal sample offset to 0. So it must be called once
+// per emulated frame, right after runFrame() -- not from an independent
+// audio callback pulling an arbitrary chunk size, or the 534 source samples
+// get stretched/re-read to fill however many samples the audio callback
+// asked for, which is what was making the pitch sound too low.
+//
+// Fix: pull exactly one frame's audio (resampled to audioCtx.sampleRate)
+// right after runFrame(), and push it into a small ring buffer that the
+// ScriptProcessor callback drains from at its own pace.
 // ---------------------------------------------------------------------------
 let audioCtx = null;
 let scriptNode = null;
 let muted = false;
 
+// ring buffer sized for a couple hundred ms of audio headroom
+const RING_SIZE = 1 << 15;
+const ringL = new Float32Array(RING_SIZE);
+const ringR = new Float32Array(RING_SIZE);
+let ringWrite = 0;
+let ringRead = 0;
+let ringCount = 0;
+
+function ringPush(left, right) {
+  for (let i = 0; i < left.length; i++) {
+    if (ringCount >= RING_SIZE) break; // drop if the ring is already full (audio thread stalled)
+    ringL[ringWrite] = left[i];
+    ringR[ringWrite] = right[i];
+    ringWrite = (ringWrite + 1) & (RING_SIZE - 1);
+    ringCount++;
+  }
+}
+
+// scratch buffer to receive one frame of audio at the AudioContext's
+// native sample rate (e.g. 44100/48000 Hz instead of the SNES's 32000 Hz)
+let frameAudioL = null;
+let frameAudioR = null;
+
+function pushFrameAudio() {
+  if (!audioCtx) return;
+  const samplesPerFrame = Math.ceil(audioCtx.sampleRate / 60);
+  if (!frameAudioL || frameAudioL.length !== samplesPerFrame) {
+    frameAudioL = new Float32Array(samplesPerFrame);
+    frameAudioR = new Float32Array(samplesPerFrame);
+  }
+  snes.setSamples(frameAudioL, frameAudioR, samplesPerFrame);
+  ringPush(frameAudioL, frameAudioR);
+}
+
 function setupAudio() {
   if (audioCtx) return;
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  // bufferSize 2048 @ audioCtx.sampleRate; Apu.setSamples fills exactly this many
   scriptNode = audioCtx.createScriptProcessor(2048, 0, 2);
   scriptNode.onaudioprocess = function(e) {
     const outL = e.outputBuffer.getChannelData(0);
@@ -129,7 +176,18 @@ function setupAudio() {
       outR.fill(0);
       return;
     }
-    snes.setSamples(outL, outR, outL.length);
+    for (let i = 0; i < outL.length; i++) {
+      if (ringCount > 0) {
+        outL[i] = ringL[ringRead];
+        outR[i] = ringR[ringRead];
+        ringRead = (ringRead + 1) & (RING_SIZE - 1);
+        ringCount--;
+      } else {
+        // underrun: emit silence rather than stale data
+        outL[i] = 0;
+        outR[i] = 0;
+      }
+    }
   };
   scriptNode.connect(audioCtx.destination);
 }
@@ -191,6 +249,7 @@ function frameLoop() {
       snes.runFrame(false);
       snes.setPixels(frameImage.data);
       ctx.putImageData(frameImage, 0, 0);
+      pushFrameAudio();
     } catch (err) {
       log("Emulation error: " + err.message);
       console.error(err);
