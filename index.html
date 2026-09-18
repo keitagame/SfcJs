@@ -221,6 +221,9 @@ romInput.addEventListener('change', function(e) {
     if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
     if (!running) {
       running = true;
+      // 時間管理変数を初期化
+      lastTime = performance.now();
+      accumulator = 0;
       requestAnimationFrame(frameLoop);
     }
   };
@@ -231,6 +234,9 @@ pauseBtn.addEventListener('click', function() {
   if (!romLoaded) return;
   paused = !paused;
   pauseBtn.textContent = paused ? "Resume" : "Pause";
+  if (!paused) {
+    lastTime = performance.now(); // 一時停止解除時の跳ね上がり防止
+  }
 });
 
 muteBtn.addEventListener('click', function() {
@@ -240,26 +246,65 @@ muteBtn.addEventListener('click', function() {
 });
 
 // ---------------------------------------------------------------------------
-// Main loop: one Snes frame per rAF, then blit the framebuffer to canvas.
+// Main loop: 実時間(performance.now)に同期させ、遅れがあれば描画スキップして強引に追いつかせる
 // ---------------------------------------------------------------------------
-function frameLoop() {
+let lastTime = performance.now();
+let accumulator = 0;
+const MS_PER_FRAME = 1000 / 60;     // 1フレームあたりの理想ミリ秒 (約16.67ms)
+const MAX_FRAMES_PER_STEP = 10;      // 1回の描画更新で追いつかせる最大フレーム数（処理落ちスパイラル防止）
+
+function frameLoop(now) {
   if (!running) return;
+
   if (romLoaded && !paused) {
-    try {
-      snes.runFrame(false);
-      snes.setPixels(frameImage.data);
-      ctx.putImageData(frameImage, 0, 0);
-      pushFrameAudio();
-    } catch (err) {
-      log("Emulation error: " + err.message);
-      console.error(err);
-      paused = true;
-      pauseBtn.textContent = "Resume";
+    // 前回からの経過時間を計算
+    const delta = now - lastTime;
+    lastTime = now;
+
+    // タブ切り替え等で大きく飛んだ場合の上限を設定 (最大200ms分)
+    accumulator += Math.min(delta, 200);
+
+    // 今回のターンで進めるべきフレーム数
+    let framesToRun = Math.floor(accumulator / MS_PER_FRAME);
+
+    // 処理が重すぎて無限に遅れが溜まるのを防ぐため、1回の上限を制限
+    if (framesToRun > MAX_FRAMES_PER_STEP) {
+      framesToRun = MAX_FRAMES_PER_STEP;
+      accumulator = 0; // 追いつききれない遅れは切り捨てる
+    } else {
+      accumulator -= framesToRun * MS_PER_FRAME;
     }
+
+    if (framesToRun > 0) {
+      try {
+        for (let i = 0; i < framesToRun; i++) {
+          // 最後の1フレーム以外は PPU描画（snes.runFrame(true)）をスキップして高速化
+          const isLastFrame = (i === framesToRun - 1);
+          
+          // noPpu = !isLastFrame (途中フレームは画面描画計算を行わない)
+          snes.runFrame(!isLastFrame);
+
+          if (isLastFrame) {
+            snes.setPixels(frameImage.data);
+            ctx.putImageData(frameImage, 0, 0);
+          }
+
+          // 音声処理を実行
+          pushFrameAudio();
+        }
+      } catch (err) {
+        log("Emulation error: " + err.message);
+        console.error(err);
+        paused = true;
+        pauseBtn.textContent = "Resume";
+      }
+    }
+  } else {
+    lastTime = now;
   }
+
   requestAnimationFrame(frameLoop);
 }
-
 // ---------------------------------------------------------------------------
 // Keyboard input -> joypad 1
 // Bit numbers follow the standard SNES auto-joypad-read report order:
